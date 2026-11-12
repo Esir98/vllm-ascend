@@ -1,0 +1,4 @@
+pr: 1
+entries:
+  - category: feature
+    text: Added an experimental HiSparse and whole-block MemCache prefix-pooling configuration for colocated Ascend 950 serving.
