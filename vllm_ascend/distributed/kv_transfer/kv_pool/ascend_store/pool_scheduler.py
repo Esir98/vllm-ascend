@@ -58,6 +58,7 @@ class BaseKVPoolScheduler(ABC):
         self.vllm_config = vllm_config
         self.use_layerwise = use_layerwise
         self.kv_cache_config = kv_cache_config
+        self.use_hisparse_store = isinstance(getattr(kv_cache_config, "hisparse_host_num_blocks", None), int)
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.backend_name, backend_class = resolve_backend(extra_config)
         self.layerwise_offload: bool = False
@@ -127,6 +128,7 @@ class BaseKVPoolScheduler(ABC):
         )
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._async_loading_req_ids: set[str] = set()
+        self._failed_external_loads: set[str] = set()
 
         self._block_pool: BlockPool | None = None
 
@@ -609,6 +611,8 @@ class BaseKVPoolScheduler(ABC):
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._preempted_req_ids.discard(finished_req_id)
+            if self.use_hisparse_store:
+                self._failed_external_loads.discard(finished_req_id)
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
@@ -621,11 +625,19 @@ class BaseKVPoolScheduler(ABC):
             self._async_loading_req_ids.copy(),
         )
 
+        def add_request(req_meta: ReqMeta | None) -> None:
+            if req_meta is None:
+                return
+            if self.use_hisparse_store:
+                # Keep the original HMA group IDs and block table positions.
+                # The synthetic Resident and Hot groups are never transferred.
+                req_meta.kv_cache_group_ids = self.cacheable_group_ids.copy()
+                req_meta.block_ids_by_group = [list(ids) for ids in req_meta.block_ids_by_group]
+            self.retain_blocks_for_save(req_meta)
+            meta.add_request(req_meta)
+
         for request in scheduler_output.scheduled_new_reqs:
-            req_meta = self._process_new_request(request, scheduler_output, force_skip_save)
-            if req_meta is not None:
-                self.retain_blocks_for_save(req_meta)
-                meta.add_request(req_meta)
+            add_request(self._process_new_request(request, scheduler_output, force_skip_save))
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         if self.can_put:
@@ -661,9 +673,7 @@ class BaseKVPoolScheduler(ABC):
                         scheduler_output,
                         force_skip_save,
                     )
-                if req_meta is not None:
-                    self.retain_blocks_for_save(req_meta)
-                    meta.add_request(req_meta)
+                add_request(req_meta)
 
         if self._unfinished_requests:
             # Index unfinished IDs instead of copying a potentially large decode
@@ -683,10 +693,7 @@ class BaseKVPoolScheduler(ABC):
                     unscheduled_request_ids.difference_update(unscheduled_request_ids.intersection(cached_reqs.req_ids))
             for request_id, (request, block_ids) in self._unfinished_requests.items():
                 if request_id in unscheduled_request_ids:
-                    req_meta = self._process_async_load_request(request_id, request, block_ids)
-                    if req_meta is not None:
-                        self.retain_blocks_for_save(req_meta)
-                        meta.add_request(req_meta)
+                    add_request(self._process_async_load_request(request_id, request, block_ids))
 
         return meta
 
@@ -764,12 +771,22 @@ class KVPoolScheduler(BaseKVPoolScheduler):
     ) -> None:
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
         self._in_flight_save_blocks = InFlightSaveBlockTracker(vllm_config.parallel_config.world_size)
+        self._host_block_pool: BlockPool | None = None
+        self._host_group_id: int | None = None
+
+    def bind_hisparse_host_pool(self, host_group_id: int, host_block_pool: BlockPool) -> None:
+        self._host_group_id = host_group_id
+        self._host_block_pool = host_block_pool
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        if self.use_hisparse_store and connector_output.failed_recving:
+            # A failed GET can leave keys present in the Store. Avoid an
+            # endless match/GET retry when Core falls back to recomputation.
+            self._failed_external_loads.update(self._async_loading_req_ids & connector_output.failed_recving)
         super().update_connector_output(connector_output)
         meta = connector_output.kv_connector_worker_meta
         if isinstance(meta, AscendStoreKVConnectorWorkerMetadata) and self._block_pool is not None:
-            self._in_flight_save_blocks.complete(meta.completed_events, self._block_pool)
+            self._in_flight_save_blocks.complete(meta.completed_events, self._block_pool, self._host_block_pool)
 
     def has_pending_push_work(self) -> bool:
         return self._in_flight_save_blocks.has_pending_work()
@@ -786,11 +803,19 @@ class KVPoolScheduler(BaseKVPoolScheduler):
         return super().reset_store()
 
     def retain_blocks_for_save(self, req_meta: ReqMeta) -> None:
-        """Keep non-null Mamba blocks alive until their bulk save completes."""
-        if self.use_hybrid:
+        """Keep save sources alive until all workers report completion."""
+        if self.use_hisparse_store:
+            assert self._host_group_id is not None and self._host_block_pool is not None
+            assert self._block_pool is not None
+            self._in_flight_save_blocks.retain_hisparse(
+                req_meta, self._host_group_id, self.grouped_block_size, self._block_pool, self._host_block_pool
+            )
+        elif self.use_hybrid:
             self._in_flight_save_blocks.retain(req_meta, self.num_speculative_blocks_by_group, self._block_pool)
 
     def _lookup_external_hit_tokens(self, request: Request, num_computed_tokens: int) -> int | None:
+        if self.use_hisparse_store and request.request_id in self._failed_external_loads:
+            return None
         prompt_token_len = len(request.prompt_token_ids)
         if len(self.cacheable_group_ids) != len(self.original_block_size):
             # Private compressor state is rebuilt from a whole token page.
@@ -808,6 +833,6 @@ class KVPoolScheduler(BaseKVPoolScheduler):
         return self.client.lookup(
             token_len,
             request.block_hashes,
-            self.kv_cache_group_ids,
+            self.cacheable_group_ids if self.use_hisparse_store else self.kv_cache_group_ids,
             hbm_hit_tokens=num_computed_tokens,
         )

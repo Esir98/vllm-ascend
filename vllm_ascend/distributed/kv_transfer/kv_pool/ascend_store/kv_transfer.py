@@ -998,6 +998,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         invalid_block_ids_lock: threading.Lock | None = None,
         worker: Any = None,
         record_operation: Callable[[str, float, int], None] | None = None,
+        *,
+        require_complete_load: bool = False,
     ):
         super().__init__(
             m_store,
@@ -1013,18 +1015,39 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self.worker = worker
         self._record_operation_cb = record_operation
+        self.require_complete_load = require_complete_load
+
+    def _fail_complete_load(self, req_meta: ReqMeta, reason: str) -> None:
+        logger.error("Incomplete KV pool load for request %s: %s", req_meta.req_id, reason)
+        req_meta.can_save = False
+        # The connector forwards failed requests as terminal receives. Keep
+        # them out of finished_requests to avoid reporting completion twice
+        # when a scheduler poll races with this worker.
+        with self.done_task_lock:
+            self.failed_requests.add(req_meta.req_id)
 
     def _handle_request(self, req_meta: ReqMeta):
         try:
             load_spec = req_meta.load_spec
             req_id = req_meta.req_id
             if load_spec is None:
+                if self.require_complete_load:
+                    self._fail_complete_load(req_meta, "missing load specification")
+                    return
                 logger.error("KV pool async recv request %s has no load spec; skip load.", req_id)
                 self.set_finished_request(req_id)
                 return
 
             token_len = load_spec.token_len
+            if self.require_complete_load and (
+                not load_spec.can_load or not load_spec.vllm_cached_tokens < load_spec.kvpool_cached_tokens <= token_len
+            ):
+                self._fail_complete_load(req_meta, "invalid external prefix length")
+                return
             if self.worker is not None and getattr(self.worker, "tp_mismatch", False):
+                if self.require_complete_load:
+                    self._fail_complete_load(req_meta, "TP mismatch cannot restore all cache groups")
+                    return
                 group_block_size = self._get_block_size(0)
                 mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
                 loaded = self.worker._load_kv_tp_mismatch(
@@ -1043,6 +1066,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             key_list = []
             block_id_list: list[int] = []
             group_ids = req_meta.kv_cache_group_ids or [0]
+            if self.require_complete_load:
+                registered_groups = {
+                    group_id for group_id, sizes in self.token_database.group_block_len.items() if sizes
+                }
+                if (
+                    not req_meta.kv_cache_group_ids
+                    or len(set(group_ids)) != len(group_ids)
+                    or set(group_ids) != registered_groups
+                ):
+                    self._fail_complete_load(req_meta, "load metadata does not match the registered cache groups")
+                    return
             load_masks = self.token_database.load_mask(req_meta.block_hashes, token_len)
             for group_id in group_ids:
                 block_ids = req_meta.block_ids_by_group[group_id]
@@ -1052,6 +1086,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 def chunk_filter(start: int, group_id=group_id) -> bool:
                     return self.token_database.mask_allows_chunk(load_masks, group_id, start)
 
+                group_starts: list[int] | None = [] if self.require_complete_load else None
                 token_iter = self.token_database.process_token_key_strings_with_block_ids(
                     token_len,
                     req_meta.block_hashes,
@@ -1069,11 +1104,26 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         kv_cache_group_id=group_id,
                         block_id=block_id,
                     )
+                    if group_starts is not None:
+                        if block_id <= 0 or not addr or len(addr) != len(size) or any(length <= 0 for length in size):
+                            self._fail_complete_load(req_meta, f"invalid destination for cache group {group_id}")
+                            return
+                        group_starts.append(start)
                     key_list.append(key)
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+                if group_starts is not None:
+                    expected_starts = [
+                        start for start in range(mask_num, token_len, group_block_size) if chunk_filter(start)
+                    ]
+                    if group_starts != expected_starts:
+                        self._fail_complete_load(req_meta, f"missing requested pages in cache group {group_id}")
+                        return
             if not key_list:
+                if self.require_complete_load:
+                    self._fail_complete_load(req_meta, "no keys for the requested external prefix")
+                    return
                 self.set_finished_request(req_id)
                 return
             key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
@@ -1098,6 +1148,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     time.perf_counter() - load_get_start,
                     len(key_list_c),
                 )
+            if self.require_complete_load:
+                if ret is None or len(ret) != len(key_list_c) or any(code != 0 for code in ret):
+                    self._fail_complete_load(req_meta, f"backend did not load all {len(key_list_c)} keys")
+                else:
+                    self.set_finished_request(req_id)
+                return
             if isinstance(self.m_store, MemcacheBackend) and (
                 ret is None or len(ret) != len(key_list_c) or any(r != 0 for r in ret)
             ):
@@ -1144,6 +1200,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 len(key_list_c),
             )
             self.set_finished_request(req_id)
+        except Exception as exc:
+            if not self.require_complete_load:
+                raise
+            self._fail_complete_load(req_meta, f"{type(exc).__name__} during receive")
         finally:
             self.request_queue.task_done()
 

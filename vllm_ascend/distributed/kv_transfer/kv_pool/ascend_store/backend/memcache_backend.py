@@ -16,6 +16,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base impor
     BatchResultShapeError,
     get_scheduler_device_id,
     parse_qos_from_extra_config,
+    require_aligned_batch_results,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import LayerwiseKeyBuilder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import get_sharded_mamba_group_ids
@@ -67,6 +68,29 @@ class MmcDirect(Enum):
     COPY_G2L = 1
     COPY_G2H = 2
     COPY_H2G = 3
+
+
+class _HiSparseMemcacheBuffers:
+    """Keep the Host backing and validate the address space of each object."""
+
+    def __init__(self, host: torch.Tensor, device_storage: dict[int, int]):
+        if host.device.type != "cpu" or not host.is_contiguous() or not host.is_pinned() or not device_storage:
+            raise ValueError("Invalid HiSparse Memcache transfer buffers.")
+        self.host = host
+        self.host_start = host.data_ptr()
+        self.host_end = self.host_start + host.nbytes
+        self.device_ranges = [(ptr, ptr + size) for ptr, size in device_storage.items()]
+
+    def classify(self, addrs: list[int], sizes: list[int]) -> bool:
+        """Return True for Host keys and reject mixed or out-of-bounds ranges."""
+        if not addrs or len(addrs) != len(sizes) or any(size <= 0 for size in sizes):
+            raise ValueError("Invalid HiSparse Memcache block descriptors.")
+        segments = [(addr, addr + size) for addr, size in zip(addrs, sizes, strict=True)]
+        if all(self.host_start <= start < end <= self.host_end for start, end in segments):
+            return True
+        if all(any(base <= start < end <= limit for base, limit in self.device_ranges) for start, end in segments):
+            return False
+        raise ValueError("HiSparse Memcache block mixes address spaces or exceeds registered buffers.")
 
 
 # =========================================================================
@@ -198,6 +222,7 @@ class MemcacheBackend(Backend):
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
         self._pending_buffers: tuple[list[int], list[int]] | None = None
+        self._hisparse_buffers: _HiSparseMemcacheBuffers | None = None
 
         if not self._lazy_init:
             self.store = self._setup_store()
@@ -208,6 +233,7 @@ class MemcacheBackend(Backend):
             self.store.close()
             self.store = None
             self._store_initialized = False
+        self._hisparse_buffers = None
 
     def ensure_initialized(self):
         if self._store_initialized:
@@ -274,6 +300,22 @@ class MemcacheBackend(Backend):
         self._pending_buffers = (list(ptrs), list(sizes))
         self._register_buffers_if_needed()
 
+    def register_hisparse_buffers(self, host: torch.Tensor, device_storage: dict[int, int]) -> None:
+        if self._hisparse_buffers is not None or not self._store_initialized or self.store is None:
+            raise RuntimeError("HiSparse Memcache buffers require an initialized store and one registration.")
+        buffers = _HiSparseMemcacheBuffers(host, device_storage)
+        # Memcache registers the CPU virtual address. The separately registered
+        # AIV-mapped address belongs to Core's resolver and never reaches Store.
+        try:
+            for ptr, size in ((buffers.host_start, host.nbytes), *device_storage.items()):
+                result = self.store.register_buffer(ptr, size)
+                if result != 0:
+                    raise RuntimeError(f"Memcache could not register HiSparse buffer: {result}")
+        except Exception:
+            self.close()
+            raise
+        self._hisparse_buffers = buffers
+
     def unregister_buffer(self, ptrs: list[int], sizes: list[int]):
         if len(ptrs) != len(sizes):
             raise ValueError(f"ptrs and sizes must have the same length: {len(ptrs)} != {len(sizes)}")
@@ -291,6 +333,36 @@ class MemcacheBackend(Backend):
         for ptr, size in zip(ptrs, sizes):
             self.store.register_buffer(ptr, size)
         self._pending_buffers = None
+
+    def _transfer_hisparse(
+        self,
+        keys: list[str],
+        addrs: list[list[int]],
+        sizes: list[list[int]],
+        *,
+        put: bool,
+    ) -> list[int]:
+        buffers = self._hisparse_buffers
+        assert buffers is not None and self.store is not None
+        transfer = self.store.batch_put_from_layers if put else self.store.batch_get_into_layers
+        device_direction = MmcDirect.COPY_L2G if put else MmcDirect.COPY_G2L
+        host_direction = MmcDirect.COPY_H2G if put else MmcDirect.COPY_G2H
+        on_host = [buffers.classify(addr, size) for _, addr, size in zip(keys, addrs, sizes, strict=True)]
+        results = [-1] * len(keys)
+        # Memcache applies one address-space direction to the entire SDK call.
+        for host, direction in ((False, device_direction), (True, host_direction)):
+            indices = [index for index, is_host in enumerate(on_host) if is_host == host]
+            if not indices:
+                continue
+            batch_keys = [keys[index] for index in indices]
+            batch_results = require_aligned_batch_results(
+                f"HiSparse Memcache {direction.name}",
+                batch_keys,
+                transfer(batch_keys, [addrs[i] for i in indices], [sizes[i] for i in indices], direction.value),
+            )
+            for index, result in zip(indices, batch_results, strict=True):
+                results[index] = result
+        return results
 
     def exists(self, keys: list[str]) -> list[int]:
         if self._lazy_init and not self._store_initialized:
@@ -454,7 +526,11 @@ class MemcacheBackend(Backend):
             return
         assert self.store is not None
         try:
-            res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            res = (
+                self._transfer_hisparse(key, addr, size, put=False)
+                if getattr(self, "_hisparse_buffers", None) is not None
+                else self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
+            )
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -487,7 +563,11 @@ class MemcacheBackend(Backend):
         self.ensure_initialized()
         assert self.store is not None
         try:
-            res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            res = (
+                self._transfer_hisparse(key, addr, size, put=True)
+                if getattr(self, "_hisparse_buffers", None) is not None
+                else self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
+            )
             failed_codes = [int(value) for value in res if value != 0]
             failed_count = len(failed_codes)
             if failed_count:

@@ -27,7 +27,7 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_wor
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.lookup_key import LookupKeyServer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    HISPARSE_STORE_BLOCK_SIZE,
     AscendStoreKVConnectorWorkerMetadata,
     get_sharded_mamba_group_ids,
 )
@@ -58,6 +59,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
 
 def create_kv_pool_scheduler(
@@ -138,6 +140,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.use_layerwise = extra_config.get("use_layerwise", False)
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.backend_name = extra_config.get("backend", "mooncake").lower()
+        self.use_hisparse_store = isinstance(getattr(kv_cache_config, "hisparse_host_num_blocks", None), int)
+        if self.use_hisparse_store:
+            assert kv_cache_config is not None
+            self._validate_hisparse_store(vllm_config, kv_cache_config, extra_config)
         self.backend_class = get_backend_class(self.backend_name) if self.use_layerwise else None
         self.layerwise_data_plane = self.backend_class.layerwise_data_plane if self.backend_class is not None else None
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
@@ -192,6 +198,48 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             assert self.connector_worker is not None
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
+
+    def _validate_hisparse_store(
+        self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, extra_config: dict[str, Any]
+    ) -> None:
+        if self.kv_role != "kv_both" or self.use_layerwise or self.backend_name != "memcache":
+            raise ValueError("HiSparse with AscendStore requires mixed serving with kv_both and bulk MemCache.")
+        if not extra_config.get("load_async", False):
+            raise ValueError("HiSparse with AscendStore requires load_async=true to complete Host imports.")
+        if not extra_config.get("discard_partial_chunks", True) or extra_config.get("save_decode_cache", False):
+            raise ValueError("The HiSparse bulk Store prototype saves complete prompt pages only.")
+
+        parallel = vllm_config.parallel_config
+        if any(
+            size != 1
+            for size in (
+                parallel.data_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.prefill_context_parallel_size,
+                parallel.decode_context_parallel_size,
+            )
+        ):
+            raise ValueError("The HiSparse bulk Store prototype requires DP, PP, PCP and DCP to be 1.")
+        if vllm_config.speculative_config is not None or not vllm_config.model_config.enforce_eager:
+            raise ValueError("The HiSparse bulk Store prototype requires eager execution without speculation.")
+        hisparse = vllm_config.attention_config.hisparse_config
+        if not hisparse or not hisparse.eager_host_mirror or kv_cache_config.hisparse_shared_host_pool:
+            raise ValueError("HiSparse with AscendStore requires eager Host mirroring into private rank-local memory.")
+
+        groups = kv_cache_config.prefix_cacheable_groups
+        if (
+            kv_cache_config.transfer_group_ids != kv_cache_config.prefix_cacheable_group_ids
+            or len(groups) != 2
+            or {group.role.value for group in groups} != {"hisparse_source", "hisparse_indexer"}
+        ):
+            raise ValueError("The HiSparse bulk Store prototype requires exactly Source and Indexer cache groups.")
+        for group in groups:
+            spec = group.kv_cache_spec
+            specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+            if any(spec.block_size != HISPARSE_STORE_BLOCK_SIZE or spec.dtype != torch.bfloat16 for spec in specs):
+                raise ValueError(
+                    f"The HiSparse bulk Store prototype requires BF16 KV with block_size={HISPARSE_STORE_BLOCK_SIZE}."
+                )
 
     def configure_dspark_prefix_cache(self, vllm_config: VllmConfig) -> bool:
         """Opt the SFA DSpark producer into joint external prefix reuse.
@@ -494,6 +542,17 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        super().bind_kv_cache_manager(kv_cache_manager)
+        if self.use_hisparse_store:
+            from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
+
+            coordinator = get_hisparse_coordinator(kv_cache_manager)
+            host_pool = coordinator.get_host_block_pool()
+            assert coordinator.host_group_id is not None and host_pool is not None
+            assert isinstance(self.connector_scheduler, KVPoolScheduler)
+            self.connector_scheduler.bind_hisparse_host_pool(coordinator.host_group_id, host_pool)
 
     def reset_cache(self) -> bool | None:
         """Drop external Mooncake KV after a prefix-cache reset.

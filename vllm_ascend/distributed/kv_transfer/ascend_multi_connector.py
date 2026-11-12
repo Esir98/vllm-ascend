@@ -19,13 +19,24 @@ if TYPE_CHECKING:
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole, kv_cache_config: "KVCacheConfig"):
+        transfer = vllm_config.kv_transfer_config
+        self._has_hisparse_bulk_store = False
+        if isinstance(getattr(kv_cache_config, "hisparse_host_num_blocks", None), int):
+            children = transfer.kv_connector_extra_config.get("connectors", [])
+            child_names = [child.get("kv_connector") for child in children]
+            self._has_hisparse_bulk_store = any(
+                name in ("AscendStoreConnector", "MooncakeConnectorStoreV1") for name in child_names
+            )
+            if self._has_hisparse_bulk_store and (
+                transfer.kv_role != "kv_both" or child_names != ["HiSparseConnector", "AscendStoreConnector"]
+            ):
+                raise ValueError("HiSparse bulk Store needs kv_both and [HiSparseConnector, AscendStoreConnector].")
         super().__init__(
             vllm_config=vllm_config,
             role=role,
             kv_cache_config=kv_cache_config,
         )
 
-        transfer = vllm_config.kv_transfer_config
         self._requires_full_dspark_prompt = (
             uses_sfa_dspark_kv_transfer(vllm_config) and transfer.is_kv_producer and not transfer.is_kv_consumer
         )
@@ -98,7 +109,11 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
     def shutdown(self) -> None:
         # Release provider waits before joining the store's receive threads.
-        self._connectors[:] = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
+        if getattr(self, "_has_hisparse_bulk_store", False):
+            # Store GET/PUT workers may still access Host pages owned by HiSparse.
+            self._connectors[:] = reversed(self._non_slot_release_connectors)
+        else:
+            self._connectors[:] = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
         super().shutdown()
 
     def wait_for_layer_load_ready(self, layer_name: str) -> None:

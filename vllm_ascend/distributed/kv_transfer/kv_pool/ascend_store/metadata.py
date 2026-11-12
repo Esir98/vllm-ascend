@@ -19,6 +19,8 @@ from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import LayerPoolKey
 
+HISPARSE_STORE_BLOCK_SIZE = 128
+
 
 def is_kv_save_role(kv_role: str, consumer_is_to_put: bool) -> bool:
     return kv_role in ("kv_producer", "kv_both") or consumer_is_to_put
@@ -298,9 +300,18 @@ def get_sharded_mamba_group_ids(kv_cache_config: KVCacheConfig | None) -> set[in
 def infer_cacheable_group_ids(kv_cache_groups: Sequence[Any] | None) -> list[int]:
     if not kv_cache_groups:
         return [0]
-    group_ids = [i for i, group in enumerate(kv_cache_groups) if is_prefix_cacheable(group.kv_cache_spec)]
+    group_ids = [
+        i
+        for i, group in enumerate(kv_cache_groups)
+        if getattr(group, "enable_kv_transfer", True) and is_prefix_cacheable(group.kv_cache_spec)
+    ]
     assert group_ids, "AscendStore requires at least one prefix-cacheable KV cache group"
     return group_ids
+
+
+def hisparse_store_model_name(model_name: str, tp_size: int) -> str:
+    # Separate rank-local BF16 objects from the ordinary AscendStore namespace.
+    return f"{model_name}~hisparse-bf16-b{HISPARSE_STORE_BLOCK_SIZE}-tp{tp_size}"
 
 
 def get_group_block_size(group_block_sizes: Sequence[int], group_id: int) -> int:

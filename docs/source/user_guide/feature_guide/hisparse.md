@@ -50,6 +50,76 @@ For native A5 C8, replace the two dtype options with:
 | `device_buffer_size` | Per-request Hot capacity from Core's HiSparse configuration. It must cover the selected verification-row union. |
 | `kv_cache_dtype` / `indexer_kv_dtype` | Select main and Indexer KV formats independently from model-weight quantization. |
 
+## Experimental mixed serving with AscendStore
+
+A single serving instance can use HiSparse for local residency and AscendStore
+to reuse prefixes through a MemCache pool. The initial configuration is Ascend
+950 with a SIMT-capable CANN 9.2 toolchain, Model Runner V2, sparse RoPE MLA/SFA,
+BF16 main and Indexer KV, 128-token blocks, and eager execution. Use one DP
+replica and one pipeline stage, with context parallelism and speculative
+decoding disabled. TP workers use rank-local pools and Store keys. Reuse the same
+checkpoint, cache dtypes, block size and TP configuration when reading those keys.
+
+Prepare MemCache using the
+[AscendStore MemCache guide](kv_cache_pool_ascend_store.md#scenario-2-memcache-backend).
+Set `VLLM_USE_V2_MODEL_RUNNER=1` and add these options to the serving command:
+
+```bash
+--enforce-eager \
+--block-size 128 \
+--kv-cache-dtype bfloat16 \
+--enable-prefix-caching \
+--attention-config '{"indexer_kv_dtype":"bf16","hisparse_config":{"eager_host_mirror":true}}' \
+--kv-transfer-config '{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "HiSparseConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"host_pool_gib": 4}
+      },
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+          "backend": "memcache",
+          "use_layerwise": false,
+          "load_async": true,
+          "lookup_rpc_port": "0"
+        }
+      }
+    ]
+  }
+}'
+```
+
+AscendStore saves full prefix pages for the Host source and device Indexer
+groups. MemCache transfers source pages directly between the pinned Host pool
+and the Store, and Indexer pages between the NPU and the Store. Use a MemCache
+runtime that supports registering pinned Host buffers and the `COPY_H2G` and
+`COPY_G2H` transfer directions. HiSparse Resident and Hot pages stay local.
+Keep asynchronous loads enabled so Core can publish the imported Host prefix
+after successful transfer completion.
+
+To check cold and warm reuse with a small load:
+
+1. Choose a fresh prefix spanning several full 128-token blocks. Run it with
+   greedy decoding and a fixed output limit. Record the output token IDs from
+   an equivalent HiSparse-only run for comparison.
+2. Submit the request to the combined instance. Confirm zero external hits and
+   wait for the Store saves to finish.
+3. Restart the serving instance while retaining the MemCache pool. Repeat the
+   same request with the same settings. Check for nonzero external hit tokens
+   and a successful Store load, and compare the full output token IDs with the
+   cold run and the HiSparse-only reference. A local prefix hit alone cannot
+   verify the Store path.
+4. Repeat with enough KV pressure to observe a HiSparse Host-to-device refill
+   during Decode on the warm request. Record the Store load and the refill
+   separately.
+
 ## Capacity and correctness notes
 
 The resolver preserves the complete MTP query-row union before choosing LRU

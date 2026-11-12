@@ -56,6 +56,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_cache_family,
     get_sharded_mamba_group_ids,
+    hisparse_store_model_name,
     infer_cache_transfer_granularity,
     infer_cacheable_group_ids,
     infer_group_block_sizes,
@@ -197,13 +198,18 @@ class BaseKVPoolWorker(ABC):
         self.backend_name = self.backend.lower()
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
         self.use_hybrid = self._compute_use_hybrid(vllm_config, kv_cache_groups)
+        self.use_hisparse_store = isinstance(getattr(kv_cache_config, "hisparse_host_num_blocks", None), int)
         self._attention_saved_layers: set[int] = set()
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
-        self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
+        self.cacheable_group_ids = (
+            list(kv_cache_config.prefix_cacheable_group_ids)
+            if self.use_hisparse_store
+            else infer_cacheable_group_ids(kv_cache_groups)
+        )
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
         self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
@@ -251,6 +257,10 @@ class BaseKVPoolWorker(ABC):
             self.put_step = self.tp_size // self.num_kv_head
             self.head_or_tp_rank = self.tp_rank // self.put_step
         else:
+            self.head_or_tp_rank = self.tp_rank
+            self.put_step = 1
+        if getattr(self, "use_hisparse_store", False):
+            # HiSparse Source and Indexer keep rank-local pool keys.
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
         if self.use_kvpp:
@@ -331,6 +341,10 @@ class BaseKVPoolWorker(ABC):
                         partitions[-i] += 1
 
         self.metadata: list[KeyMetadata] = []
+        model_name = model_config.model.rstrip("/").split("/")[-1]
+        if getattr(self, "use_hisparse_store", False):
+            model_name = hisparse_store_model_name(model_name, self.tp_size)
+            self.model_name = model_name
         for group_id in range(self.num_kv_cache_groups):
             # the mamba kv_heads is not same with the full attention, can't share the cache data
             group_tp_rank = self.tp_rank if self.group_uses_align_state[group_id] else self.head_or_tp_rank
@@ -339,7 +353,7 @@ class BaseKVPoolWorker(ABC):
                 group_tp_rank = self.tp_rank if self.use_layerwise else self.tp_rank * self.pcp_size + self.pcp_rank
             self.metadata.append(
                 KeyMetadata(
-                    model_config.model.rstrip("/").split("/")[-1],
+                    model_name,
                     group_tp_rank,
                     self.dcp_rank,
                     self.pp_rank,
@@ -1021,6 +1035,8 @@ class BaseKVPoolWorker(ABC):
         return self.num_kv_head
 
     def get_group_tp_size(self, kv_cache_group_id: int):
+        if getattr(self, "use_hisparse_store", False):
+            return self.tp_size
         if self.use_kvpp:
             return self.tp_size * self.pcp_size
         if self.tp_mismatch:
@@ -1167,6 +1183,13 @@ class BaseKVPoolWorker(ABC):
                 multi_tp_keys = self._expand_lookup_keys_by_rank(keys, group_id)
                 num_ranks = len(multi_tp_keys) // len(keys)
                 res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
+                if getattr(self, "use_hisparse_store", False) and len(res) != len(multi_tp_keys):
+                    logger.error(
+                        "HiSparse KV pool lookup returned %d results for %d rank-local keys.",
+                        len(res),
+                        len(multi_tp_keys),
+                    )
+                    return 0
                 num_block = len(keys)
                 if use_layerwise:
                     res = self.check_all_layers_exists(
@@ -1310,6 +1333,110 @@ class KVPoolWorker(BaseKVPoolWorker):
     def set_external_slot_release_waiter(self, waiter: Callable[[int], None]) -> bool:
         return False
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        if not getattr(self, "use_hisparse_store", False):
+            return super().register_kv_caches(kv_caches)
+        self._register_hisparse_kv_caches(kv_caches)
+
+    def _register_hisparse_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import MemcacheBackend
+
+        config = self.kv_cache_config
+        assert config is not None
+        if not isinstance(self.m_store, MemcacheBackend) or self.use_layerwise or not self.load_async:
+            raise ValueError("HiSparse KV pool requires asynchronous whole-block Memcache transfers.")
+        if config.hisparse_shared_host_pool:
+            raise ValueError("HiSparse KV pool requires a private Host pool per TP rank.")
+
+        groups = config.kv_cache_groups
+        roles = {group_id: groups[group_id].role.value for group_id in self.cacheable_group_ids}
+        if sorted(roles.values()) != ["hisparse_indexer", "hisparse_source"]:
+            raise ValueError("HiSparse KV pool requires exactly one cacheable Source group and one Indexer group.")
+        context = self.vllm_config.compilation_config.static_forward_context
+        host_pool = None
+        device_storage: dict[int, int] = {}
+        self.kv_caches = kv_caches
+        self.num_blocks = config.num_blocks
+        self.group_kv_caches_base_addr = {}
+        self.group_block_len = {}
+        self.group_block_stride = {}
+        self.group_layer_cache_entry_offsets = {}
+        self.group_cache_entry_segments = {}
+        self.group_kv_cache_families = {}
+        self.group_num_layers = {}
+        for group_id, role in roles.items():
+            source = role == "hisparse_source"
+            group = groups[group_id]
+            num_blocks = config.hisparse_host_num_blocks if source else config.num_blocks
+            if num_blocks is None or num_blocks <= 1:
+                raise ValueError(f"HiSparse KV pool has no transferable {role} blocks.")
+            names = sorted(group.layer_names, key=self._extract_physical_layer_index)
+            addrs, lengths, strides = [], [], []
+            for name in names:
+                (cache,) = self._as_cache_tuple(kv_caches[name])
+                if (
+                    cache.dtype != torch.bfloat16
+                    or cache.device.type != ("cpu" if source else "npu")
+                    or cache.shape[0] == 0
+                    or not cache[0].is_contiguous()
+                ):
+                    raise ValueError(f"Unsupported HiSparse KV pool payload for {name}.")
+                layer = context[name]
+                if source:
+                    stride_scale = 1
+                    raw_host_pool = layer.hisparse_cache.runtime.registered_host_pool
+                    if host_pool is not None and raw_host_pool.data_ptr() != host_pool.data_ptr():
+                        raise ValueError("HiSparse Source layers must use one private Host pool.")
+                    host_pool = raw_host_pool
+                else:
+                    # BF16 Indexer exposes a dense alias over the shared device
+                    # slab, so logical block IDs must skip other layers' pages.
+                    stride_scale = getattr(layer, "hisparse_block_stride", None)
+                    if not isinstance(stride_scale, int) or stride_scale <= 0:
+                        raise ValueError(f"Missing HiSparse Indexer block stride for {name}.")
+                    storage = cache.untyped_storage()
+                    device_storage[storage.data_ptr()] = storage.nbytes()
+                block_bytes = cache[0].numel() * cache.element_size()
+                stride_bytes = cache.stride(0) * cache.element_size() * stride_scale
+                if (
+                    cache.shape[0] != (num_blocks - 1) * stride_scale + 1
+                    or stride_bytes < block_bytes
+                    or cache[0].numel() != self.grouped_block_size[group_id] * cache.shape[-1]
+                ):
+                    raise ValueError(f"Invalid HiSparse KV pool block geometry for {name}.")
+                start = cache.data_ptr()
+                end = start + (num_blocks - 1) * stride_bytes + block_bytes
+                if source:
+                    assert host_pool is not None
+                    if start < host_pool.data_ptr() or end > host_pool.data_ptr() + host_pool.nbytes:
+                        raise ValueError(f"HiSparse Source view for {name} exceeds its Host pool.")
+                elif end > storage.data_ptr() + storage.nbytes():
+                    raise ValueError(f"HiSparse Indexer view for {name} exceeds its device storage.")
+                addrs.append(start)
+                lengths.append(block_bytes)
+                strides.append(stride_bytes)
+            self.group_kv_caches_base_addr[group_id] = addrs
+            self.group_block_len[group_id] = lengths
+            self.group_block_stride[group_id] = strides
+            self.group_layer_cache_entry_offsets[group_id] = list(range(len(names) + 1))
+            self.group_cache_entry_segments[group_id] = [(0, 1)] * len(names)
+            self.group_kv_cache_families[group_id] = role
+            self.group_num_layers[group_id] = len(names)
+
+        if host_pool is None or not device_storage:
+            raise ValueError("HiSparse KV pool is missing Source or Indexer buffers.")
+        self.token_database.set_group_buffers(
+            self.group_kv_caches_base_addr,
+            self.group_block_len,
+            self.group_block_stride,
+            group_cache_families=self.group_kv_cache_families,
+            group_num_layers=self.group_num_layers,
+            group_layer_cache_entry_offsets=self.group_layer_cache_entry_offsets,
+            group_cache_entry_segments=self.group_cache_entry_segments,
+        )
+        self.m_store.register_hisparse_buffers(host_pool, device_storage)
+        self._start_kv_transfer_threads()
+
     def _init_cache_layout(self) -> None:
         if self.kv_cache_config is None:
             return
@@ -1375,6 +1502,7 @@ class KVPoolWorker(BaseKVPoolWorker):
                 invalid_block_ids_lock=self._invalid_block_ids_lock,
                 worker=self if self.tp_mismatch else None,
                 record_operation=self._record_kv_connector_operation,
+                **({"require_complete_load": True} if getattr(self, "use_hisparse_store", False) else {}),
             )
             self.kv_recv_thread.start()
             ready_event.wait()

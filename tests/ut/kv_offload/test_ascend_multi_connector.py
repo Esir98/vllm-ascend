@@ -26,6 +26,23 @@ def test_load_ready_observer_does_not_advance_child_attention_hooks():
     other.wait_for_layer_load.assert_not_called()
 
 
+def test_hisparse_bulk_store_shuts_down_before_its_host_pool():
+    connector = AscendMultiConnector.__new__(AscendMultiConnector)
+    host = SimpleNamespace(name="host")
+    store = SimpleNamespace(name="store")
+    connector._has_hisparse_bulk_store = True
+    connector._connectors = [host, store]
+    connector._non_slot_release_connectors = [host, store]
+
+    with patch.object(MultiConnector, "shutdown", autospec=True) as parent:
+        connector.shutdown()
+        assert connector._connectors == [store, host]
+        connector.shutdown()
+
+    assert connector._connectors == [store, host]
+    assert parent.call_args_list == [call(connector), call(connector)]
+
+
 @pytest.mark.parametrize(
     "producer,consumer,method,full_prompt",
     [
