@@ -232,3 +232,18 @@ if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()
+
+# SIMT HiSparse kernels use CANN's ASC CMake language integration. Other SOCs
+# retain their existing build and report HiSparse unavailable when selected.
+if(SOC_VERSION MATCHES "ascend950")
+  find_path(HISPARSE_SIMT_INCLUDE_DIR simt_api/asc_simt.h
+    PATHS
+      ${ASCEND_HOME_PATH}/asc/include
+      ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include
+    NO_DEFAULT_PATH)
+  if(HISPARSE_SIMT_INCLUDE_DIR)
+    add_subdirectory(csrc/hisparse)
+    target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_HISPARSE_RESOLVER)
+    target_link_libraries(vllm_ascend_C PRIVATE vllm_ascend_hisparse)
+  endif()
+endif()
