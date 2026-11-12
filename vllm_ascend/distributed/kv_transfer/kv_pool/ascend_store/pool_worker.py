@@ -1089,7 +1089,9 @@ class BaseKVPoolWorker(ABC):
     ) -> int | None:
         if self.cache_coordinator is None:
             return None
-        if sorted(kv_cache_group_ids) != list(range(self.num_kv_cache_groups)):
+        hisparse_store = getattr(self, "use_hisparse_store", False)
+        expected_groups = self.cacheable_group_ids if hisparse_store else list(range(self.num_kv_cache_groups))
+        if sorted(kv_cache_group_ids) != expected_groups:
             return None
         coordinator = self.cache_coordinator
 
@@ -1119,6 +1121,9 @@ class BaseKVPoolWorker(ABC):
 
             if keys:
                 res = self.m_store.exists(keys)  # type: ignore[assignment]
+                if hisparse_store and (res is None or len(res) != len(keys)):
+                    logger.warning("HiSparse MemCache returned an incomplete prefix lookup for group %d", group_id)
+                    return []
                 offset = 0
                 for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
                     values = res[offset : offset + count]  # type: ignore[index]

@@ -97,6 +97,30 @@ def test_hisparse_bulk_registers_source_and_indexer_with_separate_page_geometry(
     assert worker.group_kv_cache_families == {0: "hisparse_source", 1: "hisparse_indexer"}
 
 
+@pytest.mark.parametrize(("exists_results", "expected_hit"), [([1, 1], 256), ([1], 128)])
+def test_hisparse_lookup_queries_only_the_external_suffix_on_all_ranks(
+    registered_hisparse_worker, exists_results, expected_hit
+):
+    worker, _ = registered_hisparse_worker
+    worker.pp_size = worker.dcp_size = 1
+    worker.tp_size = 2
+    worker.num_kv_cache_groups = 4
+    worker.m_store.exists.return_value = exists_results
+
+    def lookup(hashes, token_len, query_group_hits, *, hbm_hit_tokens, log_context):
+        assert hbm_hit_tokens == 128
+        hits = [query_group_hits(group, hashes, None) for group in (0, 1)]
+        return token_len if all(hits) else hbm_hit_tokens
+
+    worker.cache_coordinator = SimpleNamespace(group_effective_block_sizes=[128] * 4, find_reachable_hit_tokens=lookup)
+    assert worker._lookup_with_coordinator(256, [b"local", b"external"], [0, 1], True, 128) == expected_hit
+    assert worker.m_store.exists.call_count == 2
+    for args, _ in worker.m_store.exists.call_args_list:
+        assert len(args[0]) == 2
+        assert "@head_or_tp_rank:0" in args[0][0]
+        assert "@head_or_tp_rank:1" in args[0][1]
+
+
 @pytest.mark.parametrize(("get_results", "failed"), [([0, 0], False), ([0, -1], True), ([0], True)])
 def test_hisparse_bulk_receive_requires_complete_prefix(registered_hisparse_worker, get_results, failed):
     worker, _ = registered_hisparse_worker
