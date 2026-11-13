@@ -1805,20 +1805,3 @@
 # How: initialize the capability-gated per-layer NPU adaptation after upstream init.
 # Related PR: vllm-project/vllm#60050.
 # Future Plan: remove this initialization hook when a shared backend extension supports it.
-
-# ** File: patch_hisparse_slab.py **
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.hisparse.binding.allocate_kv_cache`
-#    Why:
-#       MemCache needs a 2 MiB-aligned device registration base. The HiSparse
-#       allocator in Core has no backing slab allocator hook.
-#    How:
-#       Install before the NPU V2 runner initializes the KV cache, then align
-#       the device slab before building views for HiSparse + AscendStore.
-#       Other allocations fall through to Core's allocator.
-#    Related PR:
-#       The Ascend integration is stacked on vllm-ascend #20926. No Core
-#       allocator-hook PR is linked yet.
-#    Future Plan:
-#       Add a Core platform hook for the KV backing slab and remove this patch
-#       when the Ascend plugin requires a Core release that exposes it.
