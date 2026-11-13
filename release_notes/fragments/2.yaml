@@ -1,0 +1,4 @@
+pr: 2
+entries:
+  - category: feature
+    text: Added Ascend HiSparse P/D import using Mooncake transport, with Prefill KV imported into Decode Host Source and Indexer KV on the NPU.
