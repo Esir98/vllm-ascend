@@ -57,6 +57,8 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
     submission belong in _handle_requests.
     """
 
+    _allow_packed_mla_destination = False
+
     def __init__(
         self,
         engine: Any,
@@ -142,6 +144,9 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         self.invalid_block_ids: set[int] = set()
         self.invalid_block_ids_lock = threading.Lock()
         assert self.local_metadata is not None
+
+    def _after_transfer(self, local_addresses: list[int], lengths: list[int]) -> None:
+        return
 
     def add_requests(
         self,
@@ -981,6 +986,25 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
             for (local_layer_index, remote_layer_index), transfer_entries in transfer_entries_by_layer.items():
                 local_base_addrs = self.kv_caches_base_addr[local_layer_index]
                 remote_base_addrs = remote_tp_metadata.kv_caches_base_addr[remote_layer_index]
+                local_block_strides = self.block_strides[local_layer_index]
+                local_block_lens = self.block_lens[local_layer_index]
+                if (
+                    self._allow_packed_mla_destination
+                    and isinstance(spec, MLAAttentionSpec)
+                    and len(local_base_addrs) == 1
+                    and len(remote_base_addrs) > 1
+                ):
+                    remote_lens = remote_metadata.block_lens[remote_layer_index]
+                    if len(remote_lens) != len(remote_base_addrs) or sum(remote_lens) != local_block_lens[0]:
+                        raise ValueError(
+                            f"HiSparse packed Source length mismatch for {self.layer_names[local_layer_index]!r}"
+                        )
+                    offsets = [0]
+                    for length in remote_lens[:-1]:
+                        offsets.append(offsets[-1] + length)
+                    local_base_addrs = [local_base_addrs[0] + offset for offset in offsets]
+                    local_block_strides = local_block_strides * len(remote_base_addrs)
+                    local_block_lens = remote_lens
                 if len(local_base_addrs) != len(remote_base_addrs):
                     raise ValueError(
                         f"Mooncake KV tensor count mismatch for layer {self.layer_names[local_layer_index]!r}: "
@@ -998,9 +1022,9 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                                 f"{self.layer_names[local_layer_index]!r}, cache {cache_index}: "
                                 f"local={local_shape}, remote={remote_shape}"
                             )
-                    local_block_stride = self.block_strides[local_layer_index][cache_index]
+                    local_block_stride = local_block_strides[cache_index]
                     remote_block_stride = remote_metadata.block_strides[remote_layer_index][cache_index]
-                    local_block_len = self.block_lens[local_layer_index][cache_index]
+                    local_block_len = local_block_lens[cache_index]
                     remote_block_len = remote_metadata.block_lens[remote_layer_index][cache_index]
                     if local_block_len != remote_block_len:
                         raise ValueError(
@@ -1203,6 +1227,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 "Mooncake KV transfer failed for remote "
                 f"PP/PCP/TP rank {remote_pp_rank}/{remote_pcp_rank}/{remote_tp_rank}, ret={ret}"
             )
+        self._after_transfer(src_list, length_list)
         transfer_elapsed_ms = (time.perf_counter() - transfer_start_time) * 1000
         logger.info(
             "KV cache transfer for requests %s took %.2f ms (%d ranges, %d bytes). "
@@ -1324,6 +1349,8 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
 class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     """Worker-side framework for Mooncake pull transfers."""
 
+    _receiving_thread_cls = MooncakePullRecvingThread
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1343,7 +1370,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             if not isinstance(self.xfer_handshake_metadata, MooncakeTransferMetadata):
                 raise RuntimeError("Mooncake KV caches were registered without transfer metadata")
             ready_event = threading.Event()
-            self._recving_thread = MooncakePullRecvingThread(
+            self._recving_thread = self._receiving_thread_cls(
                 engine=self.engine,
                 vllm_config=self.vllm_config,
                 kv_cache_config=self.kv_cache_config,
@@ -1364,11 +1391,15 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 device=torch.npu.current_device(),
                 ready_event=ready_event,
             )
+            self._configure_receiving_thread(self._recving_thread)
             self._recving_thread.start()
             if not ready_event.wait(timeout=10):
                 raise RuntimeError("Timed out starting Mooncake pull receiving thread")
             if not self._recving_thread.is_alive():
                 raise RuntimeError("Mooncake pull receiving thread failed to start")
+
+    def _configure_receiving_thread(self, thread: MooncakePullRecvingThread) -> None:
+        return
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""

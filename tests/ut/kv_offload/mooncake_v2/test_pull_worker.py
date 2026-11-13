@@ -1061,6 +1061,37 @@ def test_attention_address_generation_handles_partial_head_overlap() -> None:
     assert lengths == [512]
 
 
+def test_hisparse_packed_mla_destination_splits_prefill_components() -> None:
+    spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float16)
+    thread = make_thread(
+        kv_cache_specs=[spec],
+        kv_caches_base_addr=[[1000]],
+        block_strides=[[128]],
+        block_lens=[[128]],
+    )
+    thread._allow_packed_mla_destination = True
+    remote = make_pp_metadata(
+        block_lens=[[96, 32]],
+        block_strides=[[96, 32]],
+        tp_base_addrs={0: [[5000, 6000]]},
+    )
+    src: list[int] = []
+    dst: list[int] = []
+    lengths: list[int] = []
+
+    thread._append_spec_transfer_addresses(
+        0, 0, 0, 1, 1, 1, {(0, 0): [("request", [1], [2])]}, remote, src, dst, lengths
+    )
+
+    assert src == [1128, 1224]
+    assert dst == [5192, 6064]
+    assert lengths == [96, 32]
+
+    remote.block_lens[0] = [95, 32]
+    with pytest.raises(ValueError, match="packed Source length mismatch"):
+        thread._append_spec_transfer_addresses(0, 0, 0, 1, 1, 1, {(0, 0): [("request", [1], [2])]}, remote, [], [], [])
+
+
 @pytest.mark.parametrize(("local_tp", "local_pcp"), [(1, 4), (4, 1), (2, 2)])
 @pytest.mark.parametrize(("remote_tp", "remote_pcp"), [(1, 4), (4, 1), (2, 2)])
 @pytest.mark.parametrize("worker_rank", [1, 2, 3])
